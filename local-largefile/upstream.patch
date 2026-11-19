@@ -1,0 +1,831 @@
+--- a/resource/markdown/documentNavigation.mjs
++++ b/resource/markdown/documentNavigation.mjs
+@@ -0,0 +1,55 @@
++/** Visible text coordinates shared by search, bookmarks and caret restoration. */
++export function visibleText(root) {
++  const nodes = [];
++  let text = '', previousBlock;
++  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
++  let node;
++  while ((node = walker.nextNode())) {
++    const parent = node.parentElement;
++    if (!node.textContent || parent.closest('[contenteditable="false"], script, style, .vditor-ir__marker, .vditor-ir__preview, .vditor-hint, .cm-gutters')) continue;
++    if (!parent.getClientRects().length || getComputedStyle(parent).visibility === 'hidden') continue;
++    const block = parent.closest('p, li, td, th, h1, h2, h3, h4, h5, h6, pre, .cm-line');
++    if (nodes.length && block !== previousBlock) text += '\n';
++    const start = text.length;
++    text += node.textContent;
++    nodes.push({ node, start, end: text.length });
++    previousBlock = block;
++  }
++  return { text, nodes };
++}
++
++export function literalMatches(text, query) {
++  if (!query) return [];
++  const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
++  const positions = [];
++  let match;
++  while ((match = pattern.exec(text))) {
++    positions.push(match.index);
++    pattern.lastIndex = match.index + (text.codePointAt(match.index) > 0xffff ? 2 : 1);
++  }
++  return positions;
++}
++
++export function textRange(snapshot, start, length = 0) {
++  const first = snapshot.nodes.find(item => start >= item.start && start < item.end);
++  const end = start + length;
++  const last = length ? snapshot.nodes.find(item => end > item.start && end <= item.end) : first;
++  if (!first || !last) return null;
++  const range = document.createRange();
++  range.setStart(first.node, start - first.start);
++  range.setEnd(last.node, end - last.start);
++  return range;
++}
++
++export function resolveAnchor(text, anchor) {
++  if (!anchor || !Number.isFinite(anchor.offset)) return 0;
++  const offset = Math.max(0, Math.min(Math.trunc(anchor.offset), Math.max(0, text.length - 1)));
++  if (!anchor.quote || typeof anchor.quote !== 'string') return offset;
++  const matchesContext = position => (!anchor.before || text.slice(Math.max(0, position - anchor.before.length), position) === anchor.before) &&
++    (!anchor.after || text.slice(position + anchor.quote.length, position + anchor.quote.length + anchor.after.length) === anchor.after);
++  if (text.slice(offset, offset + anchor.quote.length) === anchor.quote && matchesContext(offset)) return offset;
++  const matches = literalMatches(text, anchor.quote);
++  if (!matches.length) return offset;
++  const contextual = matches.filter(matchesContext);
++  return (contextual.length ? contextual : matches).reduce((best, position) => Math.abs(position - offset) < Math.abs(best - offset) ? position : best);
++}
+--- a/resource/markdown/index.css
++++ b/resource/markdown/index.css
+@@ -1468,3 +1468,25 @@
+     .office-read-aloud__voice-field { grid-column: 1 / -1; grid-row: 2; }
+     .office-read-aloud__settings > .office-read-aloud__stop { grid-column: 2; grid-row: 1; }
+ }
++
++/* Local large-file edition: render a bounded editable page instead of the entire document. */
++body.office-large-document { display: flex; flex-direction: column; }
++body.office-large-document #vditor { flex: 1 1 0; min-height: 0; height: 0 !important; }
++.office-large-document-bar {
++  display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 8px 12px;
++  flex: 0 0 auto; border-bottom: 1px solid var(--vscode-panel-border, #555);
++  background: var(--vscode-editor-background, #1e1e1e); color: var(--vscode-editor-foreground, #ddd);
++  font: 12px var(--vscode-font-family, system-ui); z-index: 5;
++}
++.office-large-document-bar button, .office-large-document-bar select, .office-large-document-bar input {
++  color: inherit; background: var(--vscode-input-background, #333); border: 1px solid var(--vscode-input-border, #666);
++  border-radius: 4px; padding: 4px 8px; font: inherit; height: 28px; box-sizing: border-box;
++}
++.office-large-document-bar button { cursor: pointer; }
++.office-large-document-bar button:hover { background: var(--vscode-list-hoverBackground, #444); }
++.office-large-document-bar button:disabled { opacity: .4; cursor: default; }
++.office-large-document-bar input { width: 190px; }
++.office-large-document-auto { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; }
++.office-large-document-auto input { width: 14px; height: 14px; padding: 0; margin: 0; }
++.office-large-document-status { opacity: .8; }
++.office-large-document-status[role="alert"] { color: var(--vscode-errorForeground, #f99); }
+--- a/resource/markdown/index.js
++++ b/resource/markdown/index.js
+@@ -1,3 +1,4 @@
++import { createLargeDocumentUI } from './largeDocumentUI.mjs';
+ import { createReadAloud } from './readAloud.js';
+ import { getToolbar, bindShortcut, createContextMenu, setAIAvailable, openToolbarExport } from "./util.js";
+ import { observeWorkspaceAbsoluteImages, createMarkdownValueReader, restoreWorkspaceBaseUrls, } from "./imagePath.js";
+@@ -17,88 +18,38 @@
+   if (item) item.hidden = true;
+ };
+ 
+-const showToolbarEntry = (root, type) => {
+-  const item = root?.querySelector?.(`.vditor-toolbar [data-type="${type}"]`)?.closest('.vditor-toolbar__item');
+-  if (item) item.hidden = false;
+-};
+-
+-const applyProState = (editor, isPro) => {
+-  document.body.classList.toggle('is-pro', !!isPro);
+-  if (!editor?.vditor?.options) {
+-    refreshExportDialogProState();
+-    return;
+-  }
+-
+-  editor.vditor.options.isPro = !!isPro;
+-  if (editor.options) {
+-    editor.options.isPro = !!isPro;
+-  }
+-
+-  if (isPro) {
+-    removeLockedDecorations(document);
+-    hideToolbarEntry(document, 'pro-upgrade');
+-    hideToolbarEntry(document, 'help');
+-  } else {
+-    showToolbarEntry(document, 'pro-upgrade');
+-    showToolbarEntry(document, 'help');
+-  }
+-
+-  const keymapButton = editor.vditor.toolbar?.elements?.keymap?.firstElementChild;
+-  if (keymapButton) {
+-    keymapButton.classList.toggle('vditor-pro-locked', !isPro);
+-    keymapButton.querySelector('.vditor-pro-locked__badge')?.remove();
+-    keymapButton.querySelector('.vditor-pro-locked__tooltip')?.remove();
+-    if (!isPro) {
+-      keymapButton.insertAdjacentHTML('beforeend', '<span class="vditor-pro-locked__badge" aria-hidden="true">PRO</span>');
+-      const tooltip = document.createElement('span');
+-      tooltip.className = 'vditor-pro-locked__tooltip';
+-      tooltip.setAttribute('aria-hidden', 'true');
+-      const text = document.createElement('span');
+-      text.className = 'vditor-pro-locked__tooltip-text';
+-      text.textContent = `${keymapButton.title || keymapButton.getAttribute('aria-label')} · Pro`;
+-      tooltip.append(text);
+-      keymapButton.append(tooltip);
+-    }
+-  }
+-  if (!isPro) editor.vditor.element.querySelector('.vditor-keymap-dialog')?.remove();
++// Local builds expose every bundled editor capability, independently of account state.
++// isPro remains the compatibility flag expected by the bundled Vditor controls.
++const applyLocalFeatures = (editor) => {
++  document.body.classList.add('is-pro');
++  document.body.classList.remove('is-pro-cancelled');
++  if (editor?.vditor?.options) editor.vditor.options.isPro = true;
++  if (editor?.options) editor.options.isPro = true;
++  removeLockedDecorations(document);
++  hideToolbarEntry(document, 'pro-upgrade');
++  hideToolbarEntry(document, 'help');
+   refreshExportDialogProState();
+   refreshMarkmapProLock();
+ };
+-
+-const applyProCancelledState = (editor, isProCancelled) => {
+-  document.body.classList.toggle('is-pro-cancelled', !!isProCancelled);
+-};
+-
+-const interceptCancelledProAction = (event) => {
+-  if (!document.body.classList.contains('is-pro-cancelled')) return;
+-  if (!(event.target instanceof Element) || !event.target.closest('.vditor-toolbar, .vditor-outline, .vditor-mobile-outline-trigger')) return;
+-  event.stopImmediatePropagation();
+-  if (event.type === 'click') {
+-    event.preventDefault();
+-    handler.emit('openProPanel');
+-  }
+-};
+-
+-for (const type of ['pointerdown', 'mousedown', 'touchstart', 'click']) {
+-  document.addEventListener(type, interceptCancelledProAction, true);
+-}
+ 
+ handler.on("open", async (md) => {
+   const { content, rootPath, workspaceBaseUrl, documentCacheId, pendingFragment, shouldRestoreFocus, config, fileName } = md;
+   window.__officeMarkdownFileName = fileName || 'Note';
+   const {
+-    language, isWeb, isDev, isPro, isProCancelled, markdown,
++    language, isWeb, isDev, markdown,
+     editMode, editorTheme, codeMirrorTheme, mermaidTheme
+   } = config;
+   if (isWeb) {
+     document.body.classList.add('is-web')
+   }
+-  applyProState(null, isPro)
+-  applyProCancelledState(null, isProCancelled)
++  const isPro = true;
++  applyLocalFeatures(null);
+   let editor;
+-  const getMarkdownValue = createMarkdownValueReader(() => editor, workspaceBaseUrl);
++  const readPageValue = createMarkdownValueReader(() => editor, workspaceBaseUrl);
++  const largeDocument = createLargeDocumentUI(content, text => handler.emit('save', text), { documentId: documentCacheId });
++  const getMarkdownValue = () => largeDocument.read();
+   editor = new Vditor('vditor', {
+-    value: content,
++    value: largeDocument.initialValue,
+     cdn: rootPath,
+     preventMacOptionKey: config.preventMacOptionKey !== false,
+     height: '100%',
+@@ -140,6 +91,7 @@
+         return;
+       }
+       if (payload.href?.startsWith("#")) {
++        largeDocument.goto(payload.href);
+         editor.scrollToBlock(payload.href);
+         if (payload.type === "wikilink" || payload.type === "wikilink-embed") {
+           handler.emit('telemetry', { event: 'markdown.wikilink.open' });
+@@ -152,6 +104,7 @@
+         const page = hashIndex < 0 ? uri : uri.slice(0, hashIndex);
+         const fragment = hashIndex < 0 ? "" : uri.slice(hashIndex + 1);
+         if (!page && fragment) {
++          largeDocument.goto(fragment);
+           editor.scrollToBlock(fragment);
+           handler.emit('telemetry', { event: 'markdown.wikilink.open' });
+           return;
+@@ -181,7 +134,9 @@
+       handler.emit('editViewerSettings', editor.exportViewerSettings())
+     },
+     input(content) {
+-      handler.emit("save", restoreWorkspaceBaseUrls(content, workspaceBaseUrl))
++      try {
++        handler.emit("save", largeDocument.input(restoreWorkspaceBaseUrls(content, workspaceBaseUrl)));
++      } catch { /* The paging bar shows why an invalid synthetic-header edit was rejected. */ }
+     },
+     upload: {
+       url: '/image',
+@@ -213,6 +168,7 @@
+       },
+     },
+     after() {
++      largeDocument.attach(editor, readPageValue);
+       bindLinkErrors(handler, editor);
+       const { viewerSettings } = md;
+       observeWorkspaceAbsoluteImages(document.getElementById('vditor'), workspaceBaseUrl);
+@@ -245,21 +201,7 @@
+           editor.switchEditMode(update.editMode);
+         }
+       });
+-      handler.on('proStatus', ({ isPro, isProCancelled }) => {
+-        applyProState(editor, !!isPro);
+-        applyProCancelledState(editor, !!isProCancelled);
+-        if (!isPro) {
+-          // Clear badge dismissed state so the dot reappears
+-          localStorage.removeItem('office.pro.badgeDismissed');
+-          // Re-inject badge dot into DOM if button is visible and dot was removed
+-          const btn = document.querySelector('.vditor-toolbar [data-type="pro-upgrade"]');
+-          if (btn && !btn.querySelector('.vditor-pro-badge')) {
+-            const dot = document.createElement('span');
+-            dot.className = 'vditor-pro-badge';
+-            btn.appendChild(dot);
+-          }
+-        }
+-      });
++      handler.on('proStatus', () => applyLocalFeatures(editor));
+       handler.on("update", content => {
+         if (document.querySelector("[data-type='yaml-front-matter'].vditor-code-block--cm .cm-editor.cm-focused")) {
+           return;
+@@ -267,7 +209,7 @@
+         if (getMarkdownValue() === content) {
+           return;
+         }
+-        editor.setValue(content);
++        largeDocument.update(content);
+         editor.markSaved();
+       })
+       handler.on("insertImageMarkdown", (markdown) => {
+@@ -275,6 +217,7 @@
+       })
+       handler.on("gotoBlock", (fragment) => {
+         if (fragment) {
++          largeDocument.goto(fragment);
+           editor.scrollToBlock(fragment);
+         }
+       })
+@@ -295,11 +238,13 @@
+         editor.endAIStream()
+       })
+       editor.restoreDocumentSession(true, !!shouldRestoreFocus)
++      largeDocument.restoreSession(!!shouldRestoreFocus, !!pendingFragment);
+       if (pendingFragment) {
++        largeDocument.goto(pendingFragment);
+         editor.scrollToBlock(pendingFragment);
+       }
+     }
+   })
+-  bindShortcut(handler, editor, workspaceBaseUrl);
++  bindShortcut(handler, editor, workspaceBaseUrl, getMarkdownValue);
+   createContextMenu(editor, mapVscodeLanguageToVditorLang(language), workspaceBaseUrl)
+ }).emit("init")
+--- a/resource/markdown/largeDocument.mjs
++++ b/resource/markdown/largeDocument.mjs
+@@ -0,0 +1,158 @@
++/** MIT. Local large-document support for Office Viewer. Pure source model; no DOM. */
++export const LARGE_DOCUMENT_CHARS = 48000;
++export const PAGE_CHARS = 48000;
++export const PAGE_LINES = 320;
++const linesOf = text => [...text.matchAll(/[^\n]*\n|[^\n]+$/g)].map(m => ({ text: m[0], start: m.index, end: m.index + m[0].length }));
++const trim = line => line.trim();
++export function isTableSeparator(line) {
++  const cells = trim(line).replace(/^\|/, '').replace(/\|$/, '').split('|');
++  return cells.length > 0 && cells.every(c => /^:?-{3,}:?$/.test(c.trim()));
++}
++function tableRow(line) { return trim(line).includes('|') && trim(line) !== ''; }
++function scanLine(state, line, next) {
++  const s = trim(line);
++  const fence = s.match(/^(`{3,}|~{3,})/);
++  if (fence) {
++    if (!state.fence) state.fence = { char: fence[1][0], size: fence[1].length };
++    else if (fence[1][0] === state.fence.char && fence[1].length >= state.fence.size && new RegExp(`^${state.fence.char === '`' ? '`' : '~'}+$`).test(s)) state.fence = null;
++    state.header = ''; return;
++  }
++  if (state.fence) return;
++  if (tableRow(line) && next !== undefined && isTableSeparator(next)) state.header = line + next;
++  else if (state.header && !tableRow(line)) state.header = '';
++}
++export function splitDocument(text, maxChars = PAGE_CHARS, maxLines = PAGE_LINES) {
++  const lines = linesOf(text), spans = [];
++  const state = { fence: null, header: '' };
++  let start = 0, count = 0, frontmatter = lines.length > 0 && trim(lines[0].text) === '---';
++  for (let i = 0; i < lines.length; i++) {
++    const line = lines[i];
++    const separator = i > 0 && isTableSeparator(line.text) && tableRow(lines[i - 1].text);
++    if (line.start > start && !state.fence && !frontmatter && !separator && (line.start - start >= maxChars || count >= maxLines)) {
++      spans.push({ start, end: line.start }); start = line.start; count = 0;
++    }
++    scanLine(state, line.text, lines[i + 1]?.text);
++    if (frontmatter && i > 0 && /^(---|\.\.\.)$/.test(trim(line.text))) frontmatter = false;
++    count++;
++  }
++  spans.push({ start, end: text.length });
++  return spans;
++}
++function stripSyntheticHeader(rendered, expectedPrefix) {
++  const lines = linesOf(rendered);
++  // Vditor may insert a blank paragraph before the table.
++  let i = 0;
++  while (i < lines.length && !trim(lines[i].text)) i++;
++  if (!lines[i] || !lines[i + 1] || !tableRow(lines[i].text) || !isTableSeparator(lines[i + 1].text)) {
++    throw new Error('此页的重复表头不能删除。请到表格第一页修改表头。');
++  }
++  const expected = linesOf(expectedPrefix);
++  const normalizeHeader = text => text.replace(/\s+/g, '').replace(/^\|/, '').replace(/\|$/, '');
++  if (normalizeHeader(lines[i].text) !== normalizeHeader(expected[0].text)) {
++    throw new Error('此页的重复表头不能修改。请到表格第一页修改表头。');
++  }
++  return rendered.slice(lines[i + 1].end);
++}
++export class LargeDocument {
++  constructor(text, options = {}) {
++    this.maxChars = options.maxChars || PAGE_CHARS;
++    this.maxLines = options.maxLines || PAGE_LINES;
++    this.enabled = options.force ?? (text.length >= LARGE_DOCUMENT_CHARS || linesOf(text).length > 400);
++    this.reset(text);
++  }
++  reset(text) {
++    this.text = text;
++    this.spans = this.enabled ? splitDocument(text, this.maxChars, this.maxLines) : [{ start: 0, end: text.length }];
++    this.index = Math.min(this.index || 0, this.spans.length - 1);
++    this.prefix = '';
++    this.invalidate();
++  }
++  invalidate() {
++    this.pageCache = new Map();
++    this.tablePrefixes = null;
++    this.searchCache = null;
++  }
++  preparePage(index) {
++    if (!Number.isInteger(index) || index < 0 || index >= this.spans.length) return null;
++    if (this.pageCache.has(index)) {
++      const cached = this.pageCache.get(index);
++      this.pageCache.delete(index); this.pageCache.set(index, cached);
++      return cached;
++    }
++    if (index > 0 && !this.tablePrefixes) {
++      // Scan once per document revision, rather than scanning the whole file on every turn.
++      const lines = linesOf(this.text), state = { fence: null, header: '' };
++      this.tablePrefixes = new Array(this.spans.length).fill('');
++      let page = 1;
++      for (let i = 0; i < lines.length && page < this.spans.length; i++) {
++        if (lines[i].start === this.spans[page].start) {
++          this.tablePrefixes[page++] = !state.fence && state.header && tableRow(lines[i].text) && !isTableSeparator(lines[i].text) ? state.header : '';
++        }
++        scanLine(state, lines[i].text, lines[i + 1]?.text);
++      }
++    }
++    // The first page never needs a synthetic header; leave indexing to idle preloading.
++    const span = this.spans[index], prefix = index > 0 ? this.tablePrefixes[index] : '';
++    const cached = { prefix, value: prefix + this.text.slice(span.start, span.end) };
++    this.pageCache.set(index, cached);
++    // Keep at most the current and two adjacent prepared pages, never detached editor DOM.
++    if (this.pageCache.size > 3) this.pageCache.delete(this.pageCache.keys().next().value);
++    return cached;
++  }
++  setPageSize(maxChars, maxLines) {
++    if (!Number.isInteger(maxChars) || maxChars < 1 || !Number.isInteger(maxLines) || maxLines < 1) {
++      throw new RangeError('每页容量必须为正整数');
++    }
++    const offset = this.spans[this.index].start;
++    this.maxChars = maxChars;
++    this.maxLines = maxLines;
++    this.reset(this.text);
++    return this.indexAt(offset);
++  }
++  page(index = this.index) {
++    this.index = Math.max(0, Math.min(index, this.spans.length - 1));
++    const cached = this.preparePage(this.index);
++    this.prefix = cached.prefix;
++    return cached.value;
++  }
++  commit(rendered) {
++    const span = this.spans[this.index];
++    let replacement = this.prefix ? stripSyntheticHeader(rendered, this.prefix) : rendered;
++    const original = this.text.slice(span.start, span.end);
++    const eol = original.includes('\r\n') ? '\r\n' : '\n';
++    // Editors normalize EOLs; retain the source document's convention and page boundary.
++    replacement = replacement.replace(/\r?\n/g, eol);
++    if (span.end < this.text.length && original.endsWith('\n') && !replacement.endsWith('\n')) replacement += eol;
++    const delta = replacement.length - (span.end - span.start);
++    this.text = this.text.slice(0, span.start) + replacement + this.text.slice(span.end);
++    span.end += delta;
++    for (let i = this.index + 1; i < this.spans.length; i++) { this.spans[i].start += delta; this.spans[i].end += delta; }
++    this.invalidate();
++    return this.text;
++  }
++  indexAt(offset) {
++    const index = this.spans.findIndex(s => offset >= s.start && offset < s.end);
++    return index < 0 ? this.spans.length - 1 : index;
++  }
++  matches(query) {
++    if (!query) return [];
++    if (this.searchCache?.query === query) return this.searchCache.positions;
++    const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
++    const positions = [];
++    let match;
++    while ((match = pattern.exec(this.text))) {
++      positions.push(match.index);
++      pattern.lastIndex = match.index + (this.text.codePointAt(match.index) > 0xffff ? 2 : 1);
++    }
++    this.searchCache = { query, positions };
++    return positions;
++  }
++  find(query, from = 0, backwards = false) {
++    const positions = this.matches(query);
++    if (!positions.length) return -1;
++    const start = Math.max(0, Math.min(from, this.text.length));
++    let low = 0, high = positions.length;
++    while (low < high) { const mid = (low + high) >>> 1; if (positions[mid] < start) low = mid + 1; else high = mid; }
++    return backwards ? positions[(low - 1 + positions.length) % positions.length] : positions[low % positions.length];
++  }
++}
+--- a/resource/markdown/largeDocumentUI.mjs
++++ b/resource/markdown/largeDocumentUI.mjs
+@@ -0,0 +1,330 @@
++import { LargeDocument } from './largeDocument.mjs';
++import { visibleText, literalMatches, textRange, resolveAnchor } from './documentNavigation.mjs';
++
++export function createLargeDocumentUI(content, onChange, options = {}) {
++  const pageSizes = [160, 320, 640];
++  const loadPreference = key => { try { return localStorage.getItem(key); } catch { return null; } };
++  const savePreference = (key, value) => { try { localStorage.setItem(key, String(value)); } catch { /* Storage may be unavailable. */ } };
++  const savedSize = Number(loadPreference('office.largeDocument.pageLines'));
++  const pageLines = pageSizes.includes(savedSize) ? savedSize : 320;
++  const model = new LargeDocument(content, { maxLines: pageLines, maxChars: pageLines * 150 });
++  const positionKey = options.documentId ? `office.largeDocument.position:${options.documentId}` : null;
++  let initialBookmark;
++  try { initialBookmark = positionKey ? JSON.parse(loadPreference(positionKey)) : null; } catch { initialBookmark = null; }
++  if (model.enabled && initialBookmark?.anchor) model.page(model.indexAt(resolveAnchor(content, initialBookmark.anchor)));
++  let restoring = !!initialBookmark, positionTimer, preloadTask;
++  let autoPaging = loadPreference('office.largeDocument.autoPaging') !== 'false';
++  let editor, readPage, baseline, ready = false, rendering = false, searchOffset = -1;
++  let bar, select, status, query, previous, next;
++  let wheelDistance = 0, wheelDirection = 0, wheelBlocked = false, wheelIdle, wheelBlockedUntil = 0, composing = false;
++  const activeRoot = () => editor?.vditor?.currentMode === 'ir' ? editor?.vditor?.ir?.element : editor?.vditor?.wysiwyg?.element;
++  const scrollContainer = root => {
++    for (let node = root; node && node !== document.body; node = node.parentElement) {
++      if (/(auto|scroll)/.test(getComputedStyle(node).overflowY) && node.scrollHeight > node.clientHeight + 2) return node;
++    }
++    return root;
++  };
++  const resetWheel = () => { wheelDistance = 0; wheelDirection = 0; };
++  const reportError = error => { if (status) { status.textContent = error.message; status.setAttribute('role', 'alert'); } };
++  const refresh = () => {
++    if (!bar) return;
++    if (select.options.length !== model.spans.length) {
++      select.replaceChildren();
++      for (let i = 0; i < model.spans.length; i++) {
++        const option = document.createElement('option'); option.value = String(i); option.textContent = `第 ${i + 1} / ${model.spans.length} 页`; select.append(option);
++      }
++    }
++    select.value = String(model.index);
++    previous.disabled = model.index === 0; next.disabled = model.index === model.spans.length - 1;
++    status.textContent = autoPaging ? '页底继续下滚翻页 · 页顶上滚返回 · 保存为一个文件' : '手动翻页 · 保存为一个文件'; status.removeAttribute('role');
++  };
++  const protectTableHeader = () => {
++    if (!model.prefix) return;
++    const root = editor?.vditor?.currentMode === 'ir' ? editor?.vditor?.ir?.element : editor?.vditor?.wysiwyg?.element;
++    const header = root?.querySelector('table thead');
++    if (header) { header.setAttribute('contenteditable', 'false'); header.title = '重复表头；请到表格第一页修改'; }
++  };
++  const commit = rendered => {
++    if (!ready || rendering || rendered === baseline) return model.text;
++    try { model.commit(rendered); baseline = rendered; searchOffset = -1; warmNeighbors(); return model.text; }
++    catch (error) { reportError(error); throw error; }
++  };
++  const read = () => commit(readPage?.() ?? '');
++  const warmNeighbors = () => {
++    if (preloadTask != null) {
++      if (window.cancelIdleCallback) window.cancelIdleCallback(preloadTask); else clearTimeout(preloadTask);
++    }
++    const index = model.index, text = model.text;
++    const prepare = () => {
++      preloadTask = null;
++      if (model.index !== index || model.text !== text) return;
++      model.preparePage(index - 1); model.preparePage(index + 1);
++    };
++    preloadTask = window.requestIdleCallback ? window.requestIdleCallback(prepare, { timeout: 800 }) : setTimeout(prepare, 0);
++  };
++  const sourceAnchor = (quote, approximate) => {
++    const span = model.spans[model.index];
++    const matches = literalMatches(model.text.slice(span.start, span.end), quote).map(offset => offset + span.start);
++    const offset = matches.length ? matches.reduce((best, position) => Math.abs(position - approximate) < Math.abs(best - approximate) ? position : best) : span.start;
++    return { offset, quote: matches.length ? quote : '', before: model.text.slice(Math.max(0, offset - 32), offset), after: model.text.slice(offset + quote.length, offset + quote.length + 32) };
++  };
++  const capturePosition = () => {
++    const root = activeRoot();
++    if (!root) return null;
++    const scroller = scrollContainer(root), rect = scroller.getBoundingClientRect(), snapshot = visibleText(root);
++    const span = model.spans[model.index];
++    const ratio = scroller.scrollTop / Math.max(1, scroller.scrollHeight - scroller.clientHeight);
++    const makeAnchor = (item, offset = 0) => {
++      const start = Math.max(0, Math.min(offset, item.node.textContent.length - 1));
++      const quote = item.node.textContent.slice(start, start + 64);
++      return sourceAnchor(quote, span.start + (span.end - span.start) * item.start / Math.max(1, snapshot.text.length));
++    };
++    let item, visibleOffset = 0;
++    const point = document.caretRangeFromPoint?.(rect.left + Math.min(80, rect.width / 3), rect.top + 16);
++    if (point) {
++      item = snapshot.nodes.find(entry => entry.node === point.startContainer);
++      if (item) visibleOffset = point.startOffset;
++    }
++    if (!item) item = snapshot.nodes.find(entry => {
++      const range = textRange(snapshot, entry.start, Math.min(1, entry.end - entry.start));
++      const box = range?.getBoundingClientRect(); return box && box.bottom > rect.top && box.top < rect.bottom;
++    });
++    const anchor = item ? makeAnchor(item, visibleOffset) : { offset: span.start, quote: '' };
++    const range = item ? textRange(snapshot, item.start + Math.min(visibleOffset, item.end - item.start - 1), 1) : null;
++    const bookmark = { anchor, ratio, topDelta: range ? range.getBoundingClientRect().top - rect.top : 0, caret: null };
++    const selection = window.getSelection();
++    const selected = selection?.isCollapsed && snapshot.nodes.find(entry => entry.node === selection.anchorNode);
++    if (selected) {
++      const quoteStart = Math.max(0, selection.anchorOffset - 24);
++      bookmark.caret = { anchor: makeAnchor(selected, quoteStart), delta: selection.anchorOffset - quoteStart };
++    }
++    return bookmark;
++  };
++  const savePosition = () => {
++    clearTimeout(positionTimer);
++    if (!positionKey || !ready || !model.enabled || rendering || restoring) return;
++    const bookmark = capturePosition();
++    if (bookmark) savePreference(positionKey, JSON.stringify(bookmark));
++  };
++  const schedulePosition = () => {
++    if (restoring || rendering || !ready) return;
++    clearTimeout(positionTimer); positionTimer = setTimeout(savePosition, 180);
++  };
++  const rangeForAnchor = (snapshot, anchor, length = 1) => {
++    if (!anchor?.quote) return null;
++    const absolute = resolveAnchor(model.text, anchor), span = model.spans[model.index];
++    if (absolute < span.start || absolute >= span.end) return null;
++    const sourceMatches = literalMatches(model.text.slice(span.start, span.end), anchor.quote);
++    const ordinal = sourceMatches.indexOf(absolute - span.start);
++    const renderedMatches = literalMatches(snapshot.text, anchor.quote);
++    if (ordinal < 0 || sourceMatches.length !== renderedMatches.length) return null;
++    return textRange(snapshot, renderedMatches[ordinal], length);
++  };
++  const restorePosition = (bookmark, focus = false) => {
++    const root = activeRoot();
++    if (!root || !bookmark) return;
++    const snapshot = visibleText(root), scroller = scrollContainer(root);
++    if (focus && bookmark.caret?.anchor) {
++      const caret = rangeForAnchor(snapshot, bookmark.caret.anchor, bookmark.caret.delta);
++      if (caret) {
++        caret.collapse(false); root.focus({ preventScroll: true });
++        const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(caret);
++      }
++    }
++    const range = rangeForAnchor(snapshot, bookmark.anchor);
++    if (range) scroller.scrollTop += range.getBoundingClientRect().top - scroller.getBoundingClientRect().top - (bookmark.topDelta || 0);
++    else scroller.scrollTop = Math.max(0, Math.min(1, bookmark.ratio || 0)) * (scroller.scrollHeight - scroller.clientHeight);
++    if (document.scrollingElement) document.scrollingElement.scrollTop = 0;
++  };
++  const render = (index, { edge = 'start', focus = false } = {}) => {
++    rendering = true;
++    try {
++      const page = model.page(index);
++      editor.setValue(page, true);
++      baseline = readPage();
++      protectTableHeader();
++      const root = activeRoot();
++      if (root && focus) {
++        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
++          acceptNode: node => node.parentElement?.closest('[contenteditable="false"]') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
++        });
++        let node, target;
++        while ((node = walker.nextNode())) { target = node; if (edge === 'start') break; }
++        root.focus({ preventScroll: true });
++        if (target) {
++          const range = document.createRange(); range.setStart(target, edge === 'start' ? 0 : target.textContent.length); range.collapse(true);
++          const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
++        }
++      }
++      if (root) { const scroller = scrollContainer(root); scroller.scrollTop = edge === 'end' ? scroller.scrollHeight : 0; }
++      if (document.scrollingElement) document.scrollingElement.scrollTop = 0;
++      refresh(); warmNeighbors();
++    } finally { rendering = false; schedulePosition(); }
++  };
++  const go = (index, options) => {
++    if (!ready || index < 0 || index >= model.spans.length || index === model.index) return false;
++    try { const text = read(); onChange(text); render(index, options); resetWheel(); return true; }
++    catch (error) { reportError(error); return false; }
++  };
++  const canAutoPage = (event, direction) => {
++    const root = activeRoot();
++    if (!autoPaging || !ready || rendering || restoring || composing || !root?.contains(event.target) ||
++        event.target.closest('input, textarea, select, button, dialog, .cm-editor, [contenteditable="false"]') ||
++        event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.isComposing || !window.getSelection()?.isCollapsed) return false;
++    if (direction > 0 ? model.index === model.spans.length - 1 : model.index === 0) return false;
++    const scroller = scrollContainer(root);
++    // A code block or another nested scroll region must consume its own scroll first.
++    for (let node = event.target; node && node !== scroller; node = node.parentElement) {
++      if (node === root) continue;
++      if (/(auto|scroll)/.test(getComputedStyle(node).overflowY) && node.scrollHeight > node.clientHeight + 2 &&
++          (direction > 0 ? node.scrollTop + node.clientHeight < node.scrollHeight - 2 : node.scrollTop > 2)) return false;
++    }
++    return direction > 0 ? scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2 : scroller.scrollTop <= 2;
++  };
++  const onWheel = event => {
++    const scheduleIdle = () => {
++      clearTimeout(wheelIdle);
++      wheelIdle = setTimeout(() => { wheelBlocked = false; resetWheel(); }, Math.max(180, wheelBlockedUntil - performance.now()));
++    };
++    scheduleIdle();
++    if (!event.deltaY || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
++    const direction = Math.sign(event.deltaY);
++    if (!canAutoPage(event, direction)) { resetWheel(); return; }
++    if (wheelBlocked) return;
++    if (direction !== wheelDirection) resetWheel();
++    wheelDirection = direction;
++    const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? scrollContainer(activeRoot()).clientHeight : 1;
++    wheelDistance += Math.abs(event.deltaY) * scale;
++    if (wheelDistance < 100) return;
++    event.preventDefault();
++    wheelBlocked = true; // Ignore the remaining momentum until this gesture ends.
++    go(model.index + direction, { edge: direction > 0 ? 'start' : 'end' });
++    // Start the guard after rendering: expensive pages must not consume the idle window.
++    wheelBlockedUntil = performance.now() + 500;
++    scheduleIdle();
++  };
++  const onPageKey = event => {
++    const direction = event.key === 'PageDown' ? 1 : event.key === 'PageUp' ? -1 : 0;
++    if (!direction || event.repeat || !canAutoPage(event, direction)) return;
++    if (go(model.index + direction, { edge: direction > 0 ? 'start' : 'end', focus: true })) {
++      event.preventDefault(); event.stopPropagation(); wheelBlocked = true;
++    }
++  };
++  const search = backwards => {
++    if (!ready) return;
++    try {
++      const text = read(); onChange(text);
++      const value = query.value;
++      const from = searchOffset < 0 ? 0 : (backwards ? searchOffset : searchOffset + 1);
++      const position = model.find(value, from, backwards);
++      if (position < 0) { status.textContent = '未找到匹配内容'; return; }
++      const matches = model.matches(value);
++      searchOffset = position;
++      const target = model.indexAt(position);
++      if (target !== model.index) render(target);
++      const span = model.spans[target], pageMatches = matches.filter(offset => offset >= span.start && offset < span.end);
++      const ordinal = pageMatches.indexOf(position);
++      const snapshot = visibleText(activeRoot()), renderedMatches = literalMatches(snapshot.text, value);
++      const range = pageMatches.length === renderedMatches.length ? textRange(snapshot, renderedMatches[ordinal], value.length) : null;
++      status.textContent = `第 ${matches.indexOf(position) + 1} / ${matches.length} 处 · 第 ${model.index + 1} 页`;
++      if (range) {
++        const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
++        const scroller = scrollContainer(activeRoot());
++        scroller.scrollTop += range.getBoundingClientRect().top - scroller.getBoundingClientRect().top - scroller.clientHeight / 2;
++        if (document.scrollingElement) document.scrollingElement.scrollTop = 0;
++      } else {
++        window.getSelection()?.removeAllRanges();
++        status.textContent += ' · 此源码匹配无法在预览中准确高亮，可切换源码查看';
++      }
++      schedulePosition();
++    } catch (error) { reportError(error); }
++  };
++  if (model.enabled) {
++    document.body.classList.add('office-large-document');
++    bar = document.createElement('nav'); bar.className = 'office-large-document-bar'; bar.setAttribute('aria-label', '大文件分页与全文搜索');
++    const makeButton = (text, action, label) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = text; b.setAttribute('aria-label', label || text); b.addEventListener('click', action); bar.append(b); return b; };
++    previous = makeButton('上一页', () => go(model.index - 1));
++    select = document.createElement('select'); select.setAttribute('aria-label', '选择页码'); select.addEventListener('change', () => go(Number(select.value))); bar.append(select);
++    next = makeButton('下一页', () => go(model.index + 1));
++    const sizeSelect = document.createElement('select'); sizeSelect.setAttribute('aria-label', '每页容量');
++    for (const lines of pageSizes) {
++      const option = document.createElement('option'); option.value = String(lines); option.textContent = `${lines} 行 / ${lines * 150 / 1000}k 字符`; sizeSelect.append(option);
++    }
++    sizeSelect.value = String(pageLines);
++    sizeSelect.addEventListener('change', () => {
++      try {
++        const text = read(); onChange(text);
++        const bookmark = capturePosition();
++        const lines = Number(sizeSelect.value);
++        model.setPageSize(lines * 150, lines);
++        const index = model.indexAt(resolveAnchor(model.text, bookmark?.anchor));
++        render(index); restorePosition(bookmark, true); resetWheel(); searchOffset = -1;
++        savePreference('office.largeDocument.pageLines', lines);
++      } catch (error) { reportError(error); }
++    });
++    bar.append(sizeSelect);
++    const autoLabel = document.createElement('label'); autoLabel.className = 'office-large-document-auto';
++    const autoInput = document.createElement('input'); autoInput.type = 'checkbox'; autoInput.checked = autoPaging;
++    autoInput.addEventListener('change', () => { autoPaging = autoInput.checked; resetWheel(); savePreference('office.largeDocument.autoPaging', autoPaging); refresh(); });
++    autoLabel.append(autoInput, '自动翻页'); bar.append(autoLabel);
++    query = document.createElement('input'); query.type = 'search'; query.placeholder = '搜索整篇文件'; query.setAttribute('aria-label', '搜索整篇文件'); query.addEventListener('input', () => { searchOffset = -1; }); query.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); search(e.shiftKey); } }); bar.append(query);
++    makeButton('查找', () => search(false));
++    makeButton('源码', () => handler.emit('editInVSCode', true), '在 VS Code 中打开完整 Markdown 源码');
++    status = document.createElement('span'); status.className = 'office-large-document-status'; status.setAttribute('aria-live', 'polite'); bar.append(status);
++    document.body.prepend(bar); refresh();
++    bar.setAttribute('aria-busy', 'true');
++    bar.querySelectorAll('button, input, select').forEach(control => { control.disabled = true; });
++  }
++  return {
++    initialValue: model.page(),
++    enabled: model.enabled,
++    read,
++    input: commit,
++    attach(instance, reader) {
++      editor = instance; readPage = reader; baseline = reader(); ready = true; protectTableHeader();
++      if (model.enabled) new MutationObserver(protectTableHeader).observe(document.getElementById('vditor'), { childList: true, subtree: true });
++      if (model.enabled) {
++        const host = document.getElementById('vditor');
++        host.addEventListener('wheel', onWheel, { passive: false });
++        host.addEventListener('keydown', onPageKey, true);
++        host.addEventListener('compositionstart', () => { composing = true; });
++        host.addEventListener('compositionend', () => { composing = false; });
++        host.addEventListener('scroll', schedulePosition, true);
++        host.addEventListener('keyup', schedulePosition);
++        host.addEventListener('mouseup', schedulePosition);
++        window.addEventListener('pagehide', savePosition);
++        window.addEventListener('beforeunload', savePosition);
++        warmNeighbors();
++      }
++    },
++    restoreSession(focus = false, skip = false) {
++      if (!model.enabled) return;
++      const bookmark = initialBookmark; initialBookmark = null;
++      restoring = true;
++      // Run after Vditor's own page-local focus restoration; the document anchor takes precedence.
++      requestAnimationFrame(() => requestAnimationFrame(() => {
++        if (bookmark && !skip) restorePosition(bookmark, focus);
++        restoring = false;
++        bar.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
++        bar.setAttribute('aria-busy', 'false'); refresh(); schedulePosition();
++      }));
++    },
++    update(text) {
++      if (model.text === text) return;
++      const bookmark = capturePosition();
++      model.reset(text); searchOffset = -1;
++      render(model.indexAt(resolveAnchor(text, bookmark?.anchor))); restorePosition(bookmark);
++    },
++    // Used for internal heading links; resolve headings against the whole source before scrolling.
++    goto(fragment) {
++      if (!model.enabled || !fragment) return;
++      const needle = decodeURIComponent(fragment.replace(/^#/, '')).toLocaleLowerCase();
++      const lines = model.text.matchAll(/^#{1,6}\s+(.+)$/gm);
++      for (const line of lines) {
++        const title = line[1].trim().replace(/\s+#+$/, '');
++        const slug = title.toLocaleLowerCase().replace(/[^\p{L}\p{N}_\s-]/gu, '').replace(/\s+/g, '-');
++        if (slug === needle || title.toLocaleLowerCase() === needle) { go(model.indexAt(line.index)); return; }
++      }
++    },
++  };
++}
+--- a/resource/markdown/util.js
++++ b/resource/markdown/util.js
+@@ -66,26 +66,6 @@
+         document.execCommand('insertText', false, text.trim());
+     }
+ };
+-
+-const PRO_BADGE_KEY = 'office.pro.badgeDismissed';
+-
+-function makeProUpgradeBtn() {
+-    const dismissed = localStorage.getItem(PRO_BADGE_KEY) === '1';
+-    return {
+-        name: 'pro-upgrade',
+-        tip: 'Upgrade to Pro',
+-        className: 'right',
+-        icon: `<span class="codicon codicon-mail" aria-hidden="true"></span>${dismissed ? '' : '<span class="vditor-pro-badge"></span>'}`,
+-        click() {
+-            handler.emit('telemetry', { event: 'markdown.toolbar.pro-letter-click' });
+-            handler.emit('openProPanel');
+-            localStorage.setItem(PRO_BADGE_KEY, '1');
+-            // Remove badge dot from DOM without re-rendering
+-            const btn = document.querySelector('.vditor-toolbar [data-type="pro-upgrade"]');
+-            if (btn) btn.querySelector('.vditor-pro-badge')?.remove();
+-        },
+-    };
+-}
+ 
+ export async function getToolbar(resPath, onSave = null, isPro = false, onExport = null, onMarkmap = null, readAloud = null) {
+     const codicon = (name) => `<span class="codicon codicon-${name}" aria-hidden="true"></span>`;
+@@ -135,7 +115,6 @@
+                 onExport?.()
+             }
+         },
+-        ...(isPro ? [] : [makeProUpgradeBtn()]),
+         "|",
+         "editor-theme",
+         "editor-theme-toggle",
+@@ -429,8 +408,8 @@
+     return !!node?.closest?.(".vditor-code-block--cm .cm-editor");
+ };
+ 
+-export const bindShortcut = (handler, editor, workspaceBaseUrl = '') => {
+-    const getMarkdownValue = createMarkdownValueReader(() => editor, workspaceBaseUrl);
++export const bindShortcut = (handler, editor, workspaceBaseUrl = '', readWholeDocument = null) => {
++    const getMarkdownValue = readWholeDocument || createMarkdownValueReader(() => editor, workspaceBaseUrl);
+     let _exec = document.execCommand.bind(document)
+     document.execCommand = (cmd, ...args) => {
+         if (cmd === 'delete') {

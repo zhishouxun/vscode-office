@@ -1,0 +1,2 @@
+# Unified-diff context lines preserve the upstream file's original whitespace.
+upstream.patch -whitespace

@@ -1,5 +1,7 @@
 # Office Viewer
 
+> 本分支包含大文件分页、自动翻页、阅读位置恢复与本地免费功能修改。使用和构建方式见 [大文件版说明](README-LOCAL.md)。
+
 English | [简体中文](README-CN.md) | [繁體中文](README-TW.md)
 
 ## Introduction
